@@ -1,5 +1,5 @@
 import os
-from typing import List
+from typing import List, Literal
 
 import dotenv
 from langchain_core.messages import SystemMessage, HumanMessage
@@ -60,7 +60,7 @@ def select_nodes(state: State):
         return Command(goto=END)
     # 拿到所有的tree
     trees = doc_tree_store.mget(doc_ids)
-    # print(tree_structure)
+    # print(trees)
     system_prompt_list = [
         f"""你是一个文档导航助手。你的任务是从给定的【文档层级树】中，识别出与用户问题最相关的节点 ID（node_id）。
         检索规则：
@@ -92,28 +92,60 @@ def select_nodes(state: State):
 # LLM并行评价文档content批处理
 def grade_node_content(state: State):
     class output(BaseModel):
-        ans: str = Field(description="文档是否与问题相关，只能“yes” or “no”")
+        ans: Literal["yes", "no"] = Field(description="判断内容是否能回答问题或与问题高度相关")
+        # reason: str = Field(description="简要解释判断理由（可选，用于调试）")
 
     node_ids = state["node_ids"]
-    if len(node_ids) == 0:
+    if not node_ids:
         return Command(goto=END)
 
     query = state["query"]
-    node_ids = state["node_ids"]
-    node_content_list = node_content_store.mget(node_ids)
-    system_prompt = f"""
-    你是一个文档阅读专家，你需要判断用户提供的内容是否与以下问题相关，只回答“yes” 或 “no”，若内容为空回复“no”：
-    问题： {query}
-    """
-    msg_list = [
-        [SystemMessage(content=system_prompt), HumanMessage(content=f"内容如下：{node_content}")]
-        for node_content in node_content_list
-    ]
+    # node_list 现在是从 store 拿到的字典列表，包含 content, path, summary 等
+    node_list = node_content_store.mget(node_ids)
+
+    # 构造批量请求
+    msg_list = []
+    for node in node_list:
+        if not node: continue
+
+        # 核心优化：提供多维度的上下文
+        system_prompt = f"""你是一个专业的技术文档审查专家。
+你的任务是判断下方提供的【文档片段】是否包含足够的信息来回答、或者与用户的【问题】直接相关。
+
+【评分标准】：
+1. 能够直接回答用户的问题或提供操作步骤 -> yes
+2. 虽然不能完全回答，但提供了关键背景、定义或相关的配置参数 -> yes
+3. 内容仅提及关键词但属于无关主题，或者内容完全为空 -> no
+4. 内容是无法理解的代码片段或目录列表且无解释说明 -> no
+
+【用户的原始问题】：
+{query}
+"""
+
+        user_content = f"""
+### 待评估文档信息：
+- 章节路径: {node.get('path', '未知')}
+- 章节核心摘要: {node.get('summary', '无')}
+- 核心内容: 
+---
+{node.get('content', '')}
+---
+"""
+        msg_list.append([
+            SystemMessage(content=system_prompt),
+            HumanMessage(content=user_content)
+        ])
+
+    # 批量调用模型
     response_list = grade_model.with_structured_output(schema=output).batch(msg_list)
-    final_node_ids = []
-    final_content = []
+
+    final_nodes = []
     for i, response in enumerate(response_list):
+        print(response.ans)
+        # print(response.reason)
+
         if response.ans == "yes":
-            final_content.append(node_content_list[i])
-            final_node_ids.append(node_ids[i])
-    return {"final_node_ids": final_node_ids,"final_content": final_content}
+            # 返回完整的节点对象，方便后续 Agent 引用 path 和 content
+            final_nodes.append(node_list[i])
+
+    return {"final_nodes": final_nodes}

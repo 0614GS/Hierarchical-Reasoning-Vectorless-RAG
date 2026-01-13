@@ -33,5 +33,5 @@ if __name__ == "__main__":
     # ):
     #     print(chunk)
 
-    res = search_workflow.invoke({"query": "中间件应该怎么使用？"})
+    res = search_workflow.invoke({"query": "什么是长期记忆？"})
     print(res)

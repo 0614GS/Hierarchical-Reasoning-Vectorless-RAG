@@ -1,3 +1,5 @@
+import asyncio
+import uuid
 import glob
 import json
 import os
@@ -26,24 +28,6 @@ extract_model = ChatOpenAI(model="Qwen/Qwen2.5-32B-Instruct", temperature=0)
 
 # extract_model = ChatOpenAI(model="Qwen/Qwen3-Omni-30B-A3B-Instruct", temperature=0)
 # extract_model = ChatOpenAI(model="gpt-oss-120b", temperature=0)
-
-
-class GlobalCounter:
-    """全局计数器，用于生成跨文件的唯一 ID"""
-
-    def __init__(self, prefix=""):
-        self.count = 0
-        self.prefix = prefix
-
-    def get_next(self):
-        self.count += 1
-        return f"{self.prefix}{str(self.count).zfill(4)}"
-
-
-# 初始化全局计数器
-node_counter = GlobalCounter(prefix="")  # 生成 0001, 0002...
-doc_counter = GlobalCounter(prefix="doc_")  # 生成 doc_0001...
-
 
 # 获取扁平化的node列表
 def extract_nodes_from_markdown(markdown_content: str) -> List[Dict]:
@@ -150,7 +134,7 @@ def build_tree_from_flat_nodes(node_list: List[Dict]) -> List[Dict]:
 
 
 # 使用大模型提取关键词与摘要
-def generate_metadata_with_llm(title: str, path: str, content: str, children_summary: str = "") -> Dict:
+async def generate_metadata_with_llm(title: str, path: str, content: str, children_summary: str = "") -> Dict:
     """
     调用大模型生成 Summary 和 Keywords。
     为了稳定性，使用了简单的重试机制。
@@ -184,7 +168,7 @@ def generate_metadata_with_llm(title: str, path: str, content: str, children_sum
     max_retries = 3
     for attempt in range(max_retries):
         try:
-            response = extract_model.with_structured_output(schema=outputSchema).invoke([
+            response = await extract_model.with_structured_output(schema=outputSchema).ainvoke([
                 SystemMessage(system_prompt),
                 HumanMessage(user_prompt)
             ])
@@ -198,64 +182,91 @@ def generate_metadata_with_llm(title: str, path: str, content: str, children_sum
 
 
 # 树的递归处理与 ID 生成
-def process_tree_recursive(nodes: List[Dict], parent_path: str) -> List[Dict]:
-    """
-    递归遍历树，为每个节点生成 ID、Path、Summary 和 Keywords。
-    """
-    processed_nodes = []
+# 全局并发限制，防止瞬间打爆 LLM API (例如限制并发数为 10)
+sem = asyncio.Semaphore(10)
 
-    for node in nodes:
-        # 构建当前节点的完整路径 (Path)
+
+async def process_tree_recursive(nodes: List[Dict], parent_path: str) -> List[Dict]:
+    """
+    异步递归遍历树。
+    特性：
+    1. 同级节点并发执行 (Parallel Siblings)。
+    2. 自底向上汇总 (Bottom-Up): 父节点会等待所有子节点完成后，拿到汇总信息才开始生成自己的元数据。
+    """
+
+    # 内部函数, 处理单个节点的逻辑
+    async def _process_single_node(node: Dict) -> Dict:
+        # 1. 构建基础信息
         current_title = node['title']
         current_path = f"{parent_path} > {current_title}" if parent_path else current_title
-
-        # 获取 node_id
-        node_id = node_counter.get_next()
-
-        # 立即存入本地内容存储 (node_id -> text)
         content = node.get('text', '')
-        node_content_store.mset([
-            (node_id, content)
-        ])
 
-        print(f"  [Storage] Saved content for node {node_id}")
-
+        # 2. 【递归关键】：先处理子节点 (递归调用主函数)
+        # 这里会等待该节点下的所有子节点并发处理完成
         children = []
         children_info_for_parent = ""
-        if node.get('nodes'):
-            # 等待子节点处理完成
-            children = process_tree_recursive(node['nodes'], current_path)
 
-            # 3. 【汇总子信息】将所有子节点的 title 和 summary 拼接，给父节点参考
+        if node.get('nodes'):
+            # await 这一层，意味着当前节点会挂起，直到它的子树全部构建完毕
+            children = await process_tree_recursive(node['nodes'], current_path)
+
+            # 汇总子节点信息给 LLM 参考
             summary_list = [
                 (f"- {child['title']}: {child['summary']} "
                  f"(Keywords: {', '.join(child['keywords'])})") for child in children
             ]
             children_info_for_parent = "\n".join(summary_list)
 
-        # 生成当前节点任务
-        metadata = generate_metadata_with_llm(
-            title=current_title,
-            path=current_path,
-            content=content,
-            children_summary=children_info_for_parent  # 传入参考信息
-        )
-
-        final_node = {
+        # 3. 生成当前节点的元数据 (LLM)
+        # 使用 Semaphore 控制并发，避免 Rate Limit
+        async with sem:
+            metadata = await generate_metadata_with_llm(
+                title=current_title,
+                path=current_path,
+                content=content,
+                children_summary=children_info_for_parent
+            )
+        node_id = str(uuid.uuid4())[:6]
+        # 4. 构建完整存储对象 (Metadata + Content) 并存入 DB
+        full_content_obj = {
             "node_id": node_id,
-            "path": current_path,  # 修正变量名为 current_path
+            "title": current_title,
+            "path": current_path,
+            "content": content,
+            "summary": metadata.get("summary", ""),
+            "keywords": metadata.get("keywords", [])
+        }
+
+        # 使用 asyncio.to_thread 在独立的线程中执行同步写入，避免阻塞事件循环
+        await asyncio.to_thread(
+            node_content_store.mset, [(node_id, full_content_obj)]
+        )
+        print(f"  [Storage] Saved node {node_id}: {current_title}")
+
+        # 5. 返回给上一层的轻量级节点结构
+        return {
+            "node_id": node_id,
+            "path": current_path,
             "title": current_title,
             "keywords": metadata.get("keywords", []),
             "summary": metadata.get("summary", ""),
             "nodes": children
         }
-        processed_nodes.append(final_node)
 
-    return processed_nodes
+    # --- 主逻辑：并发调度 ---
+
+    # 1. 为当前层级的每一个节点创建一个 Task
+    tasks = [_process_single_node(node) for node in nodes]
+
+    # 2. 并发执行所有 Task，并按顺序收集结果
+    # 这里实现了同级并发：List 中的 Node 1, Node 2... 会同时开始跑
+    results = await asyncio.gather(*tasks)
+
+    return list(results)
 
 
 # 主流程
-def analyze_markdown_file(file_path: str):
+async def analyze_markdown_file(file_path: str):
     """
     主函数：读取文件 -> 解析 -> 处理 -> 保存
     """
@@ -276,7 +287,7 @@ def analyze_markdown_file(file_path: str):
     # 递归增强节点信息 (ID, Path, Summary, Keywords)
     file_name = os.path.splitext(os.path.basename(file_path))[0]
 
-    processed_tree = process_tree_recursive(
+    processed_tree = await process_tree_recursive(
         nodes=tree_structure,
         parent_path=file_name  # 将文件名作为 Path 的第一级
     )
@@ -285,7 +296,7 @@ def analyze_markdown_file(file_path: str):
     doc_overview = generate_doc_global_summary(file_name, processed_tree)
 
     # 为整个文档生成 doc_id 并存入 doc_tree_store
-    doc_id = doc_counter.get_next()
+    doc_id = str(uuid.uuid4())[:4]
     doc_data = {
         "doc_id": doc_id,
         "doc_name": file_name,
@@ -346,7 +357,7 @@ def generate_doc_global_summary(doc_name: str, level1_nodes: List[Dict]) -> Dict
 
 
 # 批量处理主入口
-def batch_process_markdowns(input_dir: str, output_dir: str):
+async def batch_process_markdowns(input_dir: str, output_dir: str):
     """批量处理入口"""
     md_files = glob.glob(os.path.join(input_dir, "*.md"))
     if not md_files:
@@ -359,7 +370,7 @@ def batch_process_markdowns(input_dir: str, output_dir: str):
     global_index_list = []
 
     for md_file in md_files:
-        doc_result = analyze_markdown_file(md_file)
+        doc_result = await analyze_markdown_file(md_file)
 
         with open(os.path.join(output_dir, doc_result["doc_id"] + ".json"), "w", encoding="utf-8") as f:
             json.dump(doc_result, f, indent=2, ensure_ascii=False)
@@ -384,4 +395,4 @@ if __name__ == "__main__":
     INPUT_DIR = "../data/input/deepagents"
     OUTPUT_DIR = "../data/output"
 
-    batch_process_markdowns(INPUT_DIR, OUTPUT_DIR)
+    asyncio.run(batch_process_markdowns(INPUT_DIR, OUTPUT_DIR))

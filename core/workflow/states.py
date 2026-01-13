@@ -7,5 +7,4 @@ class State(TypedDict):
     query: str
     doc_ids: List[str]
     node_ids: List[str]
-    final_node_ids: List[str]
-    final_content: List[str]
+    final_nodes: List[dict]

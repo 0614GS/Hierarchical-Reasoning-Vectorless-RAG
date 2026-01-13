@@ -24,8 +24,10 @@ doc_tree_fs = LocalFileStore(docs_path)
 node_content_store = EncoderBackedStore(
     store=node_fs,
     key_encoder=lambda k: k,
-    value_serializer=lambda v: v.encode('utf-8'),
-    value_deserializer=lambda v: v.decode('utf-8')
+    # 存入：将 Python 对象转为 JSON 字符串，再转为字节
+    value_serializer=lambda v: json.dumps(v, ensure_ascii=False).encode('utf-8'),
+    # 取出：将字节转回字符串，再解析为 Python 对象（Dict/List）
+    value_deserializer=lambda v: json.loads(v.decode('utf-8')) if v else None
 )
 
 # 用于存放(doc_id, tree_structure)

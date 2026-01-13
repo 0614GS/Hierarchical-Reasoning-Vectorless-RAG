@@ -1,5 +1,0 @@
-The main agent uses descriptions to decide which subagent to call. Be specific:
-
-✅ **Good:** `"Analyzes financial data and generates investment insights with confidence scores"`
-
-❌ **Bad:** `"Does finance stuff"`
