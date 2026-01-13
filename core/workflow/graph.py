@@ -15,9 +15,9 @@ search_workflow = (
 
     .add_edge(START, "select_docs")
     # map，send到挑选节点 select_nodes
-    .add_conditional_edges("select_docs", fetch_tree_and_send)
+    .add_edge("select_docs", "select_nodes")
     # reduce 汇聚边 并 send到评价节点grade_node_content
-    .add_conditional_edges("select_nodes", fetch_node_and_send)
+    .add_edge("select_nodes", "grade_node_content")
     # 直接汇聚到END
     .add_edge("grade_node_content", END)
     .compile()
