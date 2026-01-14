@@ -2,5 +2,6 @@
 .idea
 .langgraph_api
 __pycache__/
-/opencode.json
-/langgraph.json
+opencode.json
+langgraph.json
+AGENTS.md
