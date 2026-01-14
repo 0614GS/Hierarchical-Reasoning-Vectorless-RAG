@@ -1,30 +1,15 @@
-import os
+import logging
 from typing import List, Literal
 
-import dotenv
 from langchain_core.messages import SystemMessage, HumanMessage
-from langchain_openai import ChatOpenAI
 from langgraph.constants import END
 from langgraph.types import Command
 from pydantic import BaseModel, Field
 
+from core.models.models import read_model, grade_model
 from core.workflow.prompts import global_index
 from core.workflow.states import State
 from data.storage import doc_tree_store, node_content_store
-
-dotenv.load_dotenv()
-os.environ['OPENAI_API_KEY'] = os.getenv("SI_API_KEY")
-os.environ['OPENAI_BASE_URL'] = os.getenv("SI_BASE_URL")
-
-search_model = ChatOpenAI(
-    model="MiniMaxAI/MiniMax-M2",
-    temperature=0,
-)
-
-grade_model = ChatOpenAI(
-    model="MiniMaxAI/MiniMax-M2",
-    temperature=0
-)
 
 
 def select_docs(state: State):
@@ -57,14 +42,13 @@ def select_docs(state: State):
     """
 
     # 3. 执行调用
-    response = search_model.with_structured_output(schema=output).invoke([
+    response = read_model.with_structured_output(schema=output).invoke([
         SystemMessage(content=system_prompt),
         HumanMessage(content=f"用户的搜索意图：'{query}'\n请给出最相关的文档列表。")
     ])
 
     print(f"--- [Router] 选定的文档: {response.doc_ids} ---")
     print(f"--- [Router] 理由: {response.reasoning} ---")
-
     return {"doc_ids": response.doc_ids}
 
 
@@ -100,7 +84,7 @@ def select_nodes(state: State):
          HumanMessage(content=f"用户的问题是：'{query}'。请给出最相关的 node_id列表。")]
         for system_prompt in system_prompt_list]
     # 调用模型
-    response_list = search_model.with_structured_output(schema=output).batch(msg_list)
+    response_list = read_model.with_structured_output(schema=output).batch(msg_list)
     full_node_ids = []
     for response in response_list:
         full_node_ids.extend(response.node_ids)
